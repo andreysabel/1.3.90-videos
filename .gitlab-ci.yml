@@ -1,0 +1,102 @@
+# Integración continua de VideoVault (la app vive en videos/).
+#
+#   verify: lint, typecheck y tests unitarios en paralelo
+#   build:  next build (solo si verify pasa)
+#
+# El único runner compartido en línea (cloudrun-ephemeral) usa el executor
+# "shell": ignora `image:` y no admite `services:`. Por eso aquí no hay
+# MongoDB ni RustFS y solo se ejecutan los tests unitarios. Los tests de
+# integración (tests/integration) y E2E (tests/e2e) se ejecutan en local con
+# `docker compose up -d` + `npm test` / `npm run test:e2e`.
+
+workflow:
+  rules:
+    # Pipelines de merge request, de ramas y de tags, sin duplicar los de
+    # rama cuando ya hay una MR abierta.
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+stages:
+  - verify
+  - build
+
+default:
+  image: node:24-slim
+  # El runner compartido solo acepta jobs con esta tag (run_untagged=false).
+  tags: [cloudrun]
+  interruptible: true
+  before_script:
+    - cd videos
+    - node --version
+    - npm ci --prefer-offline --no-audit --no-fund
+  cache:
+    key:
+      files:
+        - videos/package-lock.json
+    paths:
+      - .npm/
+    policy: pull
+
+variables:
+  npm_config_cache: $CI_PROJECT_DIR/.npm
+  NEXT_TELEMETRY_DISABLED: "1"
+  # Playwright no necesita descargar navegadores: no hay E2E en CI.
+  PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+  CI: "true"
+
+lint:
+  stage: verify
+  # El primer job descarga las dependencias y rellena la caché de npm.
+  cache:
+    key:
+      files:
+        - videos/package-lock.json
+    paths:
+      - .npm/
+    policy: pull-push
+  script:
+    - npm run lint
+
+typecheck:
+  stage: verify
+  script:
+    - npm run typecheck
+
+unit-tests:
+  stage: verify
+  script:
+    - npm run test:unit -- --reporter=default --reporter=junit --outputFile.junit=junit.xml
+  artifacts:
+    when: always
+    reports:
+      junit: videos/junit.xml
+    expire_in: 1 week
+
+build:
+  stage: build
+  needs: [lint, typecheck, unit-tests]
+  variables:
+    # Valores de relleno: el build no se conecta a MongoDB ni a RustFS, pero
+    # algunos módulos leen estas variables al importarse.
+    MONGODB_URI: "mongodb://127.0.0.1:27017/?serverSelectionTimeoutMS=1000"
+    MONGODB_DB: videovault
+    RUSTFS_ENDPOINT: "http://127.0.0.1:9001"
+    RUSTFS_ACCESS_KEY: ci-placeholder
+    RUSTFS_SECRET_KEY: ci-placeholder
+    RUSTFS_BUCKET: videos
+    JWT_SECRET: ci-build-only-not-a-real-secret
+  cache:
+    - key:
+        files:
+          - videos/package-lock.json
+      paths:
+        - .npm/
+      policy: pull
+    - key: next-$CI_COMMIT_REF_SLUG
+      paths:
+        - videos/.next/cache/
+  script:
+    - npm run build

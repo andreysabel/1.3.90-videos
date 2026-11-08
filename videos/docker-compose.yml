@@ -1,0 +1,33 @@
+# Servicios locales para VideoVault.
+#   docker compose up -d
+# RustFS expone su API S3 en el puerto 9000 del contenedor; la mapeamos al
+# 9001 del host para cumplir RUSTFS_ENDPOINT=http://localhost:9001.
+# La consola web de RustFS queda en http://localhost:9002.
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    container_name: videovault-rustfs
+    ports:
+      - "9001:9000"
+      - "9002:9001"
+    environment:
+      RUSTFS_ACCESS_KEY: rustfsadmin
+      RUSTFS_SECRET_KEY: rustfsadmin
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_CORS_ALLOWED_ORIGINS: "*"
+    volumes:
+      - rustfs-data:/data
+    restart: unless-stopped
+
+  mongodb:
+    image: mongo:8
+    container_name: videovault-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    restart: unless-stopped
+
+volumes:
+  rustfs-data:
+  mongo-data:
