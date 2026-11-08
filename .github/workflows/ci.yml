@@ -1,0 +1,179 @@
+# Integración continua de VideoVault en GitHub Actions (la app vive en videos/).
+#
+#   verify:      lint, typecheck y tests unitarios en paralelo
+#   integration: tests de integración contra MongoDB y RustFS reales
+#   build:       next build
+#   e2e:         Playwright en Chrome contra la app compilada, MongoDB y RustFS
+#
+# A diferencia del runner de GitLab (executor shell), aquí sí hay contenedores
+# de servicio, así que se ejecutan también integración y E2E. Los servicios
+# se publican en los mismos puertos que docker-compose.yml, por eso los tests
+# funcionan sin cambios contra localhost.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    working-directory: videos
+
+env:
+  NEXT_TELEMETRY_DISABLED: "1"
+  NODE_VERSION: "24"
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: videos/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run lint
+
+  typecheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: videos/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: videos/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run test:unit
+
+  integration-tests:
+    runs-on: ubuntu-latest
+    services:
+      mongodb:
+        # mongo:8 no arranca en el kernel >= 6.19 del runner (SERVER-121912).
+        image: mongo:7
+        ports: ["27017:27017"]
+      rustfs:
+        image: rustfs/rustfs:latest
+        ports: ["9001:9000"]
+        env:
+          RUSTFS_ACCESS_KEY: rustfsadmin
+          RUSTFS_SECRET_KEY: rustfsadmin
+          RUSTFS_CORS_ALLOWED_ORIGINS: "*"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: videos/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      # Si los servicios no responden, Vitest se saltaría la integración en
+      # silencio: aquí fallamos explícitamente antes de llegar a los tests.
+      - name: Esperar a MongoDB y RustFS
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/27017) 2>/dev/null && curl -s -o /dev/null http://127.0.0.1:9001; then
+              echo "Servicios listos"; exit 0
+            fi
+            sleep 2
+          done
+          echo "MongoDB o RustFS no responden" >&2; exit 1
+      - run: npx vitest run tests/integration
+
+  build:
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck, unit-tests]
+    env:
+      # Valores de relleno: el build no se conecta a MongoDB ni a RustFS.
+      MONGODB_URI: "mongodb://127.0.0.1:27017/?serverSelectionTimeoutMS=1000"
+      MONGODB_DB: videovault
+      RUSTFS_ENDPOINT: "http://127.0.0.1:9001"
+      RUSTFS_ACCESS_KEY: ci-placeholder
+      RUSTFS_SECRET_KEY: ci-placeholder
+      RUSTFS_BUCKET: videos
+      JWT_SECRET: ci-build-only-not-a-real-secret
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: videos/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - uses: actions/cache@v4
+        with:
+          path: videos/.next/cache
+          key: next-${{ runner.os }}-${{ hashFiles('videos/package-lock.json') }}-${{ github.sha }}
+          restore-keys: next-${{ runner.os }}-${{ hashFiles('videos/package-lock.json') }}-
+      - run: npm run build
+
+  e2e:
+    runs-on: ubuntu-latest
+    needs: [build, integration-tests]
+    timeout-minutes: 20
+    services:
+      mongodb:
+        # mongo:8 no arranca en el kernel >= 6.19 del runner (SERVER-121912).
+        image: mongo:7
+        ports: ["27017:27017"]
+      rustfs:
+        image: rustfs/rustfs:latest
+        ports: ["9001:9000"]
+        env:
+          RUSTFS_ACCESS_KEY: rustfsadmin
+          RUSTFS_SECRET_KEY: rustfsadmin
+          RUSTFS_CORS_ALLOWED_ORIGINS: "*"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: videos/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        env:
+          # playwright.config.ts usa el Chrome que ya trae ubuntu-latest.
+          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
+      - name: Esperar a MongoDB y RustFS
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/127.0.0.1/27017) 2>/dev/null && curl -s -o /dev/null http://127.0.0.1:9001; then
+              echo "Servicios listos"; exit 0
+            fi
+            sleep 2
+          done
+          echo "MongoDB o RustFS no responden" >&2; exit 1
+      # El webServer de Playwright compila la app y la arranca en el puerto 3100.
+      - run: npm run test:e2e
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            videos/playwright-report/
+            videos/test-results/
+          retention-days: 7
